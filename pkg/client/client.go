@@ -2,22 +2,19 @@ package client
 
 import (
 	"context"
+	"embed"
 	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/cloudquery/cq-provider-sdk/helpers"
-	"github.com/getsentry/sentry-go"
-	"google.golang.org/grpc/status"
-
-	"github.com/cloudquery/cloudquery/pkg/client/history"
-
 	"github.com/cloudquery/cloudquery/internal/logging"
 	"github.com/cloudquery/cloudquery/internal/telemetry"
+	"github.com/cloudquery/cloudquery/pkg/client/history"
 	"github.com/cloudquery/cloudquery/pkg/config"
 	"github.com/cloudquery/cloudquery/pkg/module"
 	"github.com/cloudquery/cloudquery/pkg/module/drift"
@@ -26,10 +23,13 @@ import (
 	"github.com/cloudquery/cloudquery/pkg/policy"
 	"github.com/cloudquery/cloudquery/pkg/ui"
 	"github.com/cloudquery/cq-provider-sdk/cqproto"
+	"github.com/cloudquery/cq-provider-sdk/helpers"
 	"github.com/cloudquery/cq-provider-sdk/provider"
 	"github.com/cloudquery/cq-provider-sdk/provider/schema"
 	"github.com/cloudquery/cq-provider-sdk/provider/schema/diag"
+	"github.com/getsentry/sentry-go"
 	"github.com/golang-migrate/migrate/v4"
+	"github.com/google/uuid"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-version"
 	"github.com/hashicorp/hcl/v2"
@@ -39,10 +39,17 @@ import (
 	otrace "go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
 	gcodes "google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 var (
 	ErrMigrationsNotSupported = errors.New("provider doesn't support migrations")
+	//go:embed migrations/*.sql
+	coreMigrations embed.FS
+)
+
+const (
+	latestVersion = "latest"
 )
 
 // FetchRequest is provided to the Client to execute a fetch on one or more providers
@@ -147,14 +154,8 @@ type PoliciesRunRequest struct {
 	// OutputDir is the output dir for policy execution output.
 	OutputDir string
 
-	// StopOnFailure signals policy execution to stop after first failure.
-	StopOnFailure bool
-
 	// RunCallBack is the callback method that is called after every policy execution.
 	RunCallback policy.UpdateCallback
-
-	// FailOnViolation if true policy run will return error if there are violations
-	FailOnViolation bool
 }
 
 // ModuleRunRequest is the request used to run a module.
@@ -284,6 +285,13 @@ func New(ctx context.Context, options ...Option) (*Client, error) {
 			c.Logger.Warn("postgres validation warning", "err", err)
 		}
 	}
+	// migrate cloudquery core tables to latest version
+	if c.DSN != "" {
+		if err := c.MigrateCore(ctx); err != nil {
+			return nil, fmt.Errorf("failed to migrate cloudquery_core tables: %w", err)
+		}
+	}
+
 	if err := c.setupTableCreator(ctx); err != nil {
 		return nil, err
 	}
@@ -408,6 +416,11 @@ func (c *Client) Fetch(ctx context.Context, request FetchRequest) (res *FetchRes
 	// Ignoring gctx since we don't want to stop other running providers if one provider fails with an error
 	// future refactor should probably use a something else rather than error group.
 	errGroup, _ := errgroup.WithContext(ctx)
+	fetchId, err := uuid.NewUUID()
+	if err != nil {
+		return nil, err
+	}
+
 	for _, providerConfig := range request.Providers {
 		providerConfig := providerConfig
 		c.Logger.Debug("creating provider plugin", "provider", providerConfig.Name)
@@ -416,8 +429,22 @@ func (c *Client) Fetch(ctx context.Context, request FetchRequest) (res *FetchRes
 			c.Logger.Error("failed to create provider plugin", "provider", providerConfig.Name, "error", err)
 			return nil, err
 		}
+
 		// TODO: move this into an outer function
 		errGroup.Go(func() error {
+			fs := FetchSummary{
+				FetchId:         fetchId,
+				ProviderName:    providerConfig.Name,
+				ProviderVersion: providerPlugin.Version(),
+				Start:           time.Now().UTC(),
+			}
+
+			defer func() {
+				if err := SaveFetchSummary(ctx, c.pool, &fs); err != nil {
+					c.Logger.Error("failed to save fetch summary", "err", err)
+				}
+			}()
+
 			pLog := c.Logger.With("provider", providerConfig.Name, "alias", providerConfig.Alias, "version", providerPlugin.Version())
 			pLog.Info("requesting provider to configure")
 			if c.HistoryCfg != nil {
@@ -444,7 +471,12 @@ func (c *Client) Fetch(ctx context.Context, request FetchRequest) (res *FetchRes
 
 			pLog.Info("requesting provider fetch", "partial_fetch_enabled", providerConfig.EnablePartialFetch)
 			fetchStart := time.Now()
-			stream, err := providerPlugin.Provider().FetchResources(ctx, &cqproto.FetchResourcesRequest{Resources: providerConfig.Resources, PartialFetchingEnabled: providerConfig.EnablePartialFetch})
+			stream, err := providerPlugin.Provider().FetchResources(ctx,
+				&cqproto.FetchResourcesRequest{
+					Resources:              providerConfig.Resources,
+					PartialFetchingEnabled: providerConfig.EnablePartialFetch,
+					ParallelFetchingLimit:  providerConfig.MaxParallelResourceFetchLimit,
+				})
 			if err != nil {
 				return err
 			}
@@ -454,6 +486,7 @@ func (c *Client) Fetch(ctx context.Context, request FetchRequest) (res *FetchRes
 				partialFetchResults []*cqproto.FailedResourceFetch
 				fetchedResources           = make(map[string]cqproto.ResourceFetchSummary, len(providerConfig.Resources))
 				totalResources      uint64 = 0
+				totalErrors         uint64 = 0
 			)
 			for {
 				resp, err := stream.Recv()
@@ -482,6 +515,10 @@ func (c *Client) Fetch(ctx context.Context, request FetchRequest) (res *FetchRes
 							FetchResources:        fetchedResources,
 							Status:                status,
 						}
+						fs.Finish = time.Now().UTC()
+						fs.IsSuccess = true
+						fs.TotalErrorsCount = totalErrors
+						fs.TotalResourceCount = totalResources
 						return nil
 					}
 					pLog.Error("received provider fetch error", "error", err)
@@ -501,6 +538,7 @@ func (c *Client) Fetch(ctx context.Context, request FetchRequest) (res *FetchRes
 				}
 
 				totalResources += resp.ResourceCount
+				totalErrors += uint64(len(resp.PartialFetchFailedResources))
 				fetchedResources[resp.ResourceName] = resp.Summary
 
 				if resp.Error != "" {
@@ -512,6 +550,16 @@ func (c *Client) Fetch(ctx context.Context, request FetchRequest) (res *FetchRes
 				if request.UpdateCallback != nil {
 					request.UpdateCallback(update)
 				}
+
+				fs.Resources = append(fs.Resources, ResourceFetchSummary{
+					ResourceName:                resp.ResourceName,
+					FinishedResources:           resp.FinishedResources,
+					Status:                      strconv.Itoa(int(resp.Summary.Status)), // todo use human readable representation of status
+					Error:                       resp.Error,
+					PartialFetchFailedResources: resp.PartialFetchFailedResources,
+					ResourceCount:               resp.ResourceCount,
+					Diagnostics:                 resp.Summary.Diagnostics,
+				})
 			}
 		})
 	}
@@ -729,31 +777,11 @@ func (c *Client) RunPolicies(ctx context.Context, req *PoliciesRunRequest) ([]*p
 
 		c.Logger.Info("policy execution finished", "err", err)
 		if err != nil {
+			// this error means error in execution and not policy violation
+			// we should exit immeditly as this is a non-recoverable error
+			// might mean schema is incorrect, provider version
 			c.Logger.Error("policy execution finished with error", "err", err)
-			// update the ui with the error
-			if req.RunCallback != nil {
-				req.RunCallback(policy.Update{
-					PolicyName:      p.Name,
-					Source:          p.Source,
-					Version:         p.Version(),
-					FinishedQueries: 0,
-					QueriesCount:    0,
-					Error:           err.Error(),
-				})
-			}
-
-			// add the execution error to the results
-			results = append(results, &policy.ExecutionResult{
-				PolicyName: p.Name,
-				Passed:     false,
-				Error:      err.Error(),
-			})
-
-			// if failOnViolation is set, we should stop the execution
-			if req.FailOnViolation {
-				return results, nil
-			}
-			continue
+			return results, err
 		}
 
 		results = append(results, result)
@@ -790,7 +818,6 @@ func (c *Client) runPolicy(ctx context.Context, p *policy.Policy, req *PoliciesR
 
 	execReq := &policy.ExecuteRequest{
 		Policy:           p,
-		StopOnFailure:    req.StopOnFailure,
 		ProviderVersions: versions,
 		UpdateCallback:   req.RunCallback,
 	}
@@ -804,17 +831,6 @@ func (c *Client) runPolicy(ctx context.Context, p *policy.Policy, req *PoliciesR
 	result, err := c.PolicyManager.Run(ctx, execReq)
 	if err != nil {
 		return nil, err
-	}
-
-	// execution was not finished
-	if !result.Passed && req.StopOnFailure && req.RunCallback != nil {
-		req.RunCallback(policy.Update{
-			PolicyName:      p.Name,
-			Version:         p.Version(),
-			FinishedQueries: 0,
-			QueriesCount:    0,
-			Error:           "Execution stopped",
-		})
 	}
 
 	// Store output in file if requested
@@ -907,6 +923,33 @@ func (c *Client) buildProviderMigrator(migrations map[string][]byte, providerNam
 		return nil, nil, err
 	}
 	return m, providerConfig, err
+}
+
+func (c *Client) MigrateCore(ctx context.Context) error {
+	err := createCoreSchema(ctx, c.pool)
+	if err != nil {
+		return err
+	}
+	migrations, err := provider.ReadMigrationFiles(c.Logger, coreMigrations)
+	if err != nil {
+		return err
+	}
+	dsn := c.DSN + "&search_path=cloudquery"
+	m, err := provider.NewMigrator(c.Logger, migrations, dsn, "cloudquery_core")
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		if err := m.Close(); err != nil {
+			c.Logger.Error("failed to close migrator connection", "error", err)
+		}
+	}()
+
+	if err := m.UpgradeProvider(latestVersion); err != nil && err != migrate.ErrNoChange {
+		return fmt.Errorf("failed to migrate cloudquery core schema: %w", err)
+	}
+	return nil
 }
 
 func (c *Client) getProviderConfig(providerName string) (*config.RequiredProvider, error) {
@@ -1061,4 +1104,18 @@ func reportFetchSummaryErrors(span otrace.Span, fetchSummaries map[string]Provid
 		attribute.Int64("fetch.warnings.total", int64(totalWarnings)),
 		attribute.Int64("fetch.errors.total", int64(totalErrors)),
 	)
+}
+
+func createCoreSchema(ctx context.Context, pool *pgxpool.Pool) error {
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+
+	_, err = conn.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS cloudquery")
+	if err != nil {
+		return err
+	}
+	return nil
 }

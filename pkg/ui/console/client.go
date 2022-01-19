@@ -179,8 +179,8 @@ policy "%s" {
 	return nil
 }
 
-func (c Client) RunPolicies(ctx context.Context, policySource, outputDir string, stopOnFailure, failOnViolation, noResults bool) error {
-	c.c.Logger.Debug("run policy received params:", "policy", policySource, "outputDir", outputDir, "stopOnFailure", stopOnFailure, "failOnViolation", failOnViolation, "noResults", noResults)
+func (c Client) RunPolicies(ctx context.Context, policySource, outputDir string, noResults bool) error {
+	c.c.Logger.Debug("run policy received params:", "policy", policySource, "outputDir", outputDir, "noResults", noResults)
 	if err := c.DownloadProviders(ctx); err != nil {
 		return err
 	}
@@ -198,15 +198,13 @@ func (c Client) RunPolicies(ctx context.Context, policySource, outputDir string,
 
 	// if we are running in a terminal, build the progress bar
 	if ui.IsTerminal() {
-		policyRunProgress, policyRunCallback = buildPolicyRunProgress(ctx, policiesToRun, failOnViolation)
+		policyRunProgress, policyRunCallback = buildPolicyRunProgress(ctx, policiesToRun)
 	}
 	// Policies run request
 	req := &client.PoliciesRunRequest{
-		Policies:        policiesToRun,
-		OutputDir:       outputDir,
-		StopOnFailure:   stopOnFailure,
-		FailOnViolation: failOnViolation,
-		RunCallback:     policyRunCallback,
+		Policies:    policiesToRun,
+		OutputDir:   outputDir,
+		RunCallback: policyRunCallback,
 	}
 	results, err := c.c.RunPolicies(ctx, req)
 
@@ -386,10 +384,32 @@ func (c Client) DropProvider(ctx context.Context, providerName string) error {
 }
 
 func (c Client) BuildProviderTables(ctx context.Context, providerName string) error {
-	ui.ColorizedOutput(ui.ColorProgress, "Building CloudQuery provider %s schema...\n\n", providerName)
 	if err := c.DownloadProviders(ctx); err != nil {
 		return err
 	}
+
+	if err := c.buildProviderTables(ctx, providerName); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c Client) BuildAllProviderTables(ctx context.Context) error {
+	if err := c.DownloadProviders(ctx); err != nil {
+		return err
+	}
+
+	for _, p := range c.c.Providers {
+		if err := c.buildProviderTables(ctx, p.Name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c Client) buildProviderTables(ctx context.Context, providerName string) error {
+	ui.ColorizedOutput(ui.ColorProgress, "Building CloudQuery provider %s schema...\n\n", providerName)
 	if err := c.c.BuildProviderTables(ctx, providerName); err != nil {
 		ui.ColorizedOutput(ui.ColorError, "❌ Failed to build provider %s schema. Error: %s.\n\n", providerName, err.Error())
 		return err
@@ -518,7 +538,7 @@ func (c Client) describePolicy(ctx context.Context, p *policy.Policy) error {
 	t.SetHeaders("Path", "Description")
 	buildDescribePolicyTable(t, policy.Policies{p}, "")
 	t.Render()
-	ui.ColorizedOutput(ui.ColorInfo, "To execute any policy use the path defined in the table above.\nFor example `cloudquery policy run %s %s`", p.Name, getNestedPolicyExample(p.Policies[0], ""))
+	ui.ColorizedOutput(ui.ColorInfo, "To execute any policy use the path defined in the table above.\nFor example `cloudquery policy run %s`", buildPolicyPath(p.Name, getNestedPolicyExample(p.Policies[0], "")))
 	return nil
 }
 
@@ -564,7 +584,7 @@ func buildFetchProgress(ctx context.Context, providers []*config.Provider) (*Pro
 	return fetchProgress, fetchCallback
 }
 
-func buildPolicyRunProgress(ctx context.Context, policies policy.Policies, failOnViolation bool) (*Progress, policy.UpdateCallback) {
+func buildPolicyRunProgress(ctx context.Context, policies policy.Policies) (*Progress, policy.UpdateCallback) {
 	policyRunProgress := NewProgress(ctx, func(o *ProgressOptions) {
 		o.AppendDecorators = []decor.Decorator{decor.CountersNoUnit(" Finished Checks: %d/%d")}
 	})
@@ -586,15 +606,6 @@ func buildPolicyRunProgress(ctx context.Context, policies policy.Policies, failO
 		}
 		if update.Error != "" {
 			policyRunProgress.Update(update.PolicyName, ui.StatusError, fmt.Sprintf("error: %s", update.Error), 0)
-
-			if failOnViolation {
-				// update running progress as the process has terminated
-				for _, bar := range policyRunProgress.bars {
-					if bar.Status == ui.StatusInProgress {
-						policyRunProgress.Update(bar.Name, ui.StatusError, "execution stops", 0)
-					}
-				}
-			}
 			return
 		}
 
