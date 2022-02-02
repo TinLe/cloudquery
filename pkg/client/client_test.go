@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand"
 	"net"
 	"os"
@@ -33,10 +34,17 @@ func init() {
 
 func requiredTestProviders() []*config.RequiredProvider {
 	providerSrc := "cloudquery"
+	providerName := "test"
+	source := fmt.Sprintf("%s/%s", providerSrc, providerName)
 	return []*config.RequiredProvider{
 		{
-			Name:    "test",
-			Source:  &providerSrc,
+			Name:    providerName,
+			Source:  &source,
+			Version: "latest",
+		},
+		{
+			Name:    providerName,
+			Source:  nil, // Provider with no source (managed provider)
 			Version: "latest",
 		},
 	}
@@ -104,7 +112,10 @@ func TestClient_FailOnFetchWithPartialFetch(t *testing.T) {
 		},
 	})
 	assert.Nil(t, err)
-	testSummary, ok := result.ProviderFetchSummary["test"]
+	if result == nil {
+		return
+	}
+	testSummary, ok := result.ProviderFetchSummary["test(test_alias)"]
 	assert.True(t, ok)
 	assert.True(t, testSummary.HasErrors())
 	assert.Len(t, testSummary.PartialFetchErrors, 2)
@@ -139,7 +150,7 @@ func TestClient_FailOnFetch(t *testing.T) {
 		},
 	})
 	assert.Nil(t, err)
-	testSummary, ok := result.ProviderFetchSummary["test"]
+	testSummary, ok := result.ProviderFetchSummary["test(test_alias)"]
 	assert.True(t, ok)
 	assert.True(t, testSummary.HasErrors())
 	assert.Len(t, testSummary.FetchErrors, 2)
@@ -173,7 +184,7 @@ func TestClient_PartialFetch(t *testing.T) {
 		},
 	})
 	assert.Nil(t, err)
-	testSummary, ok := result.ProviderFetchSummary["test"]
+	testSummary, ok := result.ProviderFetchSummary["test(test_alias)"]
 	assert.True(t, ok)
 	assert.Len(t, testSummary.PartialFetchErrors, 2)
 }
@@ -578,7 +589,6 @@ func setupTestPlugin(t *testing.T) context.CancelFunc {
 }
 
 func Test_normalizeResources(t *testing.T) {
-
 	tests := []struct {
 		name      string
 		requested []string
@@ -699,7 +709,8 @@ func Test_collectProviderVersions(t *testing.T) {
 }
 
 func Test_CheckForProviderUpdates(t *testing.T) {
-	source := "cloudquery"
+	source := fmt.Sprintf("%s/%s", "cloudquery", "test")
+	nonExsitingSource := fmt.Sprintf("%s/%s", "cloudquery", "test1")
 	tests := []struct {
 		name      string
 		providers []*config.RequiredProvider
@@ -721,7 +732,7 @@ func Test_CheckForProviderUpdates(t *testing.T) {
 			[]*config.RequiredProvider{
 				{
 					Name:    "test1",
-					Source:  &source,
+					Source:  &nonExsitingSource,
 					Version: "v0.0.7",
 				},
 			},

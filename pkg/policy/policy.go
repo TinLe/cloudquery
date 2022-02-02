@@ -1,6 +1,9 @@
 package policy
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 type Policies []*Policy
 
@@ -53,6 +56,15 @@ func (p Policy) SubPolicy() string {
 	return p.meta.subPolicy
 }
 
+func (p Policy) HasChecks() bool {
+	for _, policy := range p.Policies {
+		if policy.HasChecks() {
+			return true
+		}
+	}
+	return len(p.Checks) > 0
+}
+
 func (p Policy) TotalQueries() int {
 	count := 0
 	if len(p.Policies) > 0 {
@@ -61,6 +73,39 @@ func (p Policy) TotalQueries() int {
 		}
 	}
 	return count + len(p.Checks)
+}
+
+// Path should not include the root of the policy
+// If no policy or control matches selector then a shell policy is returned
+
+func (p Policy) Filter(path string) Policy {
+	if path == "" {
+		return p
+	}
+	selectorPath := strings.SplitN(path, "/", 2)
+	if len(selectorPath) == 0 {
+		return p
+	}
+	var emptyPolicy Policy
+	nextPolicy := ""
+	if strings.Contains(path, "/") {
+		nextPolicy = selectorPath[1]
+	}
+	for _, policy := range p.Policies {
+		if policy.Name == selectorPath[0] {
+			return policy.Filter(nextPolicy)
+		}
+	}
+
+	for _, check := range p.Checks {
+		if check.Name == selectorPath[0] {
+			p.Checks = make([]*Check, 0)
+			p.Checks = append(p.Checks, check)
+			return p
+		}
+	}
+
+	return emptyPolicy
 }
 
 type Meta struct {
