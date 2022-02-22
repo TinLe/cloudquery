@@ -28,7 +28,6 @@ import (
 	"github.com/cloudquery/cq-provider-sdk/cqproto"
 	sdkdb "github.com/cloudquery/cq-provider-sdk/database"
 	"github.com/cloudquery/cq-provider-sdk/database/dsn"
-	"github.com/cloudquery/cq-provider-sdk/migration"
 	"github.com/cloudquery/cq-provider-sdk/migration/migrator"
 	"github.com/cloudquery/cq-provider-sdk/provider/diag"
 	"github.com/cloudquery/cq-provider-sdk/provider/execution"
@@ -40,6 +39,7 @@ import (
 	"github.com/hashicorp/go-version"
 	"github.com/hashicorp/hcl/v2"
 	zerolog "github.com/rs/zerolog/log"
+	"github.com/spf13/viper"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
@@ -201,11 +201,6 @@ type FetchDoneResult struct {
 	ResourceCount string
 }
 
-// TableCreator creates tables based on schema received from providers
-type TableCreator interface {
-	CreateTable(context.Context, execution.QueryExecer, *schema.Table, *schema.Table) error
-}
-
 type FetchUpdateCallback func(update FetchUpdate)
 
 type Option func(options *Client)
@@ -242,8 +237,6 @@ type Client struct {
 	ModuleManager module.Manager
 	// ModuleManager manages all modules lifecycle
 	PolicyManager policy.Manager
-	// TableCreator defines how tables are created in the database, only for plugin protocol < 4
-	TableCreator TableCreator
 	// HistoryConfig defines configuration for CloudQuery history mode
 	HistoryCfg *history.Config
 
@@ -462,13 +455,13 @@ func (c *Client) Fetch(ctx context.Context, request FetchRequest) (res *FetchRes
 			}
 			pLog.Info("provider configured successfully")
 
-			pLog.Info("requesting provider fetch", "partial_fetch_enabled", providerConfig.EnablePartialFetch)
+			pLog.Info("requesting provider fetch")
 			fetchStart := time.Now()
 			fetchSummary.Start = &fetchStart
 			stream, err := providerPlugin.Provider().FetchResources(ctx,
 				&cqproto.FetchResourcesRequest{
 					Resources:              providerConfig.Resources,
-					PartialFetchingEnabled: providerConfig.EnablePartialFetch,
+					PartialFetchingEnabled: true,
 					ParallelFetchingLimit:  providerConfig.MaxParallelResourceFetchLimit,
 					MaxGoroutines:          providerConfig.MaxGoroutines,
 				})
@@ -627,6 +620,30 @@ func (c *Client) GetProviderConfiguration(ctx context.Context, providerName stri
 	return providerPlugin.Provider().GetProviderConfig(ctx, &cqproto.GetProviderConfigRequest{})
 }
 
+func (c *Client) GetProviderModule(ctx context.Context, providerName string, req cqproto.GetModuleRequest) (*cqproto.GetModuleResponse, error) {
+	providerPlugin, err := c.Manager.CreatePlugin(providerName, "", nil)
+	if err != nil {
+		c.Logger.Error("failed to create provider plugin", "provider", providerName, "error", err)
+		return nil, err
+	}
+	defer func() {
+		if providerPlugin.Version() == plugin.Unmanaged {
+			c.Logger.Warn("Not closing unmanaged provider", "provider", providerName)
+			return
+		}
+		if err := c.Manager.KillProvider(providerName); err != nil {
+			c.Logger.Warn("failed to kill provider", "provider", providerName)
+		}
+	}()
+
+	inf, err := providerPlugin.Provider().GetModuleInfo(ctx, &req)
+	if err != nil && strings.Contains(err.Error(), `unknown method GetModuleInfo`) {
+		return &cqproto.GetModuleResponse{}, nil
+	}
+
+	return inf, err
+}
+
 func (c *Client) BuildProviderTables(ctx context.Context, providerName string) (retErr error) {
 	ctx, spanEnder := telemetry.StartSpanFromContext(ctx, "BuildProviderTables", trace.WithAttributes(
 		attribute.String("provider", providerName),
@@ -639,14 +656,7 @@ func (c *Client) BuildProviderTables(ctx context.Context, providerName string) (
 	}
 
 	if s.Migrations == nil {
-		// Keep the table creator if we don't have any migrations defined for this provider and hope that it works
-		for name, t := range s.ResourceTables {
-			c.Logger.Debug("creating tables for resource for provider", "resource_name", name, "provider", s.Name, "version", s.Version)
-			if err := c.TableCreator.CreateTable(ctx, c.db, t, nil); err != nil {
-				return fmt.Errorf("CreateTable(%s) failed: %w", t.Name, err)
-			}
-		}
-
+		c.Logger.Warn("provider did not define any migrations (here be dragons)", "provider", s.Name, "version", s.Version)
 		return nil
 	}
 
@@ -878,11 +888,13 @@ func (c *Client) ExecuteModule(ctx context.Context, req ModuleRunRequest) (res *
 	}
 
 	modReq := &module.ExecuteRequest{
-		Providers: req.Providers,
-		Params:    req.Params,
+		Module:        req.Name,
+		ProfileConfig: req.Config,
+		Providers:     req.Providers,
+		Params:        req.Params,
 	}
 
-	output, err := c.ModuleManager.ExecuteModule(ctx, req.Name, req.Config, modReq)
+	output, err := c.ModuleManager.ExecuteModule(ctx, modReq)
 	if err != nil {
 		return nil, err
 	}
@@ -921,7 +933,7 @@ func (c *Client) SetProviderVersion(ctx context.Context, providerName, version s
 }
 
 func (c *Client) initModules() {
-	c.ModuleManager = module.NewManager(c.db, c.Logger)
+	c.ModuleManager = module.NewManager(c.db, c.Logger, c)
 	c.ModuleManager.RegisterModule(drift.New(c.Logger))
 }
 
@@ -1070,6 +1082,8 @@ func collectProviderVersions(providers []*config.RequiredProvider, getVersion fu
 func reportFetchSummaryErrors(span trace.Span, fetchSummaries map[string]ProviderFetchSummary) {
 	var totalFetched, totalWarnings, totalErrors uint64
 
+	allowUnmanaged := Version == DevelopmentVersion && viper.GetBool("debug-sentry")
+
 	for _, ps := range fetchSummaries {
 		totalFetched += ps.TotalResourcesFetched
 		totalWarnings += ps.Diagnostics().Warnings()
@@ -1081,6 +1095,10 @@ func reportFetchSummaryErrors(span trace.Span, fetchSummaries map[string]Provide
 			attribute.Int64("fetch.errors."+ps.ProviderName, int64(ps.Diagnostics().Errors())),
 		)
 		span.SetAttributes(telemetry.MapToAttributes(ps.Metrics())...)
+
+		if ps.Version == plugin.Unmanaged && !allowUnmanaged {
+			continue
+		}
 
 		for _, e := range ps.Diagnostics().Squash() {
 			if rd, ok := e.(diag.Redactable); ok {
@@ -1164,12 +1182,6 @@ func (c *Client) initDatabase(ctx context.Context) error {
 	if err := c.MigrateCore(ctx, c.dialectExecutor); err != nil {
 		return fmt.Errorf("failed to migrate cloudquery_core tables: %w", err)
 	}
-
-	dialect, err := schema.GetDialect(c.db.DialectType())
-	if err != nil {
-		return err
-	}
-	c.TableCreator = migration.NewTableCreator(c.Logger, dialect)
 
 	return nil
 }

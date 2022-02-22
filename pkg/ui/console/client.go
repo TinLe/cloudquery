@@ -12,9 +12,11 @@ import (
 
 	"github.com/cloudquery/cloudquery/internal/getter"
 	"github.com/cloudquery/cloudquery/internal/telemetry"
+	sdkdb "github.com/cloudquery/cq-provider-sdk/database"
 	"github.com/fatih/color"
 	"github.com/getsentry/sentry-go"
 	"github.com/golang-migrate/migrate/v4"
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/hcl/v2"
 	"github.com/olekukonko/tablewriter"
 	"github.com/spf13/afero"
@@ -239,6 +241,44 @@ func (c Client) RunPolicies(ctx context.Context, policySource, outputDir string,
 	}
 
 	ui.ColorizedOutput(ui.ColorProgress, "Finished policies run...\n\n")
+	return nil
+}
+
+func (c Client) TestPolicies(ctx context.Context, policySource, snapshotDestination string) error {
+	conn, err := sdkdb.New(ctx, hclog.NewNullLogger(), c.c.DSN)
+	if err != nil {
+		c.c.Logger.Error("failed to connect to new database", "err", err)
+		return err
+	}
+	uniqueTempDir, err := os.MkdirTemp(os.TempDir(), "*-myOptionalSuffix")
+	if err != nil {
+		return err
+	}
+
+	policyManager := policy.NewManager(uniqueTempDir, conn, c.c.Logger)
+	p, err := policyManager.Load(ctx, &policy.Policy{Name: "test-policy", Source: policySource})
+	if err != nil {
+		c.c.Logger.Error("failed to create policy manager", "err", err)
+		return err
+	}
+
+	e := policy.NewExecutor(conn, c.c.Logger, nil)
+	return p.Test(ctx, e, policySource, snapshotDestination, uniqueTempDir)
+
+}
+
+func (c Client) SnapshotPolicy(ctx context.Context, policySource, snapshotDestination string) error {
+	policiesToSnapshot, err := FilterPolicies(policySource, c.cfg.Policies)
+	if err != nil {
+		ui.ColorizedOutput(ui.ColorError, err.Error())
+		return err
+	}
+	c.c.Logger.Debug("policies to snapshot", "policies", policiesToSnapshot.All())
+	for _, p := range policiesToSnapshot {
+		if err := c.snapshotControl(ctx, p, policySource, snapshotDestination); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -486,8 +526,14 @@ func (c Client) getModuleProviders(ctx context.Context) ([]*cqproto.GetProviderS
 	if err := c.DownloadProviders(ctx); err != nil {
 		return nil, err
 	}
-	list := make([]*cqproto.GetProviderSchemaResponse, len(c.cfg.Providers))
-	for i, p := range c.cfg.Providers {
+	list := make([]*cqproto.GetProviderSchemaResponse, 0, len(c.cfg.Providers))
+	dupes := make(map[string]struct{})
+	for _, p := range c.cfg.Providers {
+		if _, ok := dupes[p.Name]; ok {
+			continue
+		}
+		dupes[p.Name] = struct{}{}
+
 		s, err := c.c.GetProviderSchema(ctx, p.Name)
 		if err != nil {
 			return nil, err
@@ -500,7 +546,7 @@ func (c Client) getModuleProviders(ctx context.Context) ([]*cqproto.GetProviderS
 				s.Version = deets.Version
 			}
 		}
-		list[i] = s.GetProviderSchemaResponse
+		list = append(list, s.GetProviderSchemaResponse)
 	}
 
 	return list, nil
@@ -547,6 +593,24 @@ func (c Client) setTelemetryAttributes(span trace.Span) {
 	})
 }
 
+func (c Client) snapshotControl(ctx context.Context, p *policy.Policy, fullSelector, destination string) error {
+	p, err := c.c.LoadPolicy(ctx, p.Name, p.Source)
+	if err != nil {
+		ui.ColorizedOutput(ui.ColorError, err.Error())
+		return fmt.Errorf("failed to load policies: %w", err)
+	}
+	if !p.HasChecks() {
+		return errors.New("no checks loaded")
+	}
+
+	_, subPath := getter.ParseSourceSubPolicy(fullSelector)
+	pol := p.Filter(subPath)
+	if pol.TotalQueries() != 1 {
+		return errors.New("selector must specify only a single control")
+	}
+	return c.c.PolicyManager.Snapshot(ctx, &pol, destination, subPath)
+}
+
 func (c Client) describePolicy(ctx context.Context, p *policy.Policy, selector string) error {
 	p, err := c.c.LoadPolicy(ctx, p.Name, p.Source)
 	if err != nil {
@@ -559,6 +623,11 @@ func (c Client) describePolicy(ctx context.Context, p *policy.Policy, selector s
 
 	policyName, subPath := getter.ParseSourceSubPolicy(selector)
 
+	// The `buildDescribePolicyTable` builds the output based on Policy Name and Path
+	// In the case of no path, the PolicyName is just the root policy
+	if subPath == "" {
+		policyName = ""
+	}
 	pol := p.Filter(subPath)
 	buildDescribePolicyTable(t, policy.Policies{&pol}, policyName)
 	t.Render()
@@ -664,7 +733,12 @@ func loadConfig(path string) (*config.Config, bool) {
 	if diags != nil {
 		ui.ColorizedOutput(ui.ColorHeader, "Configuration Error Diagnostics:\n")
 		for _, d := range diags {
-			ui.ColorizedOutput(ui.ColorError, "❌ %s; %s\n", d.Summary, d.Detail)
+			if d.Subject == nil {
+				ui.ColorizedOutput(ui.ColorError, "❌ %s; %s\n", d.Summary, d.Detail)
+				continue
+			}
+
+			ui.ColorizedOutput(ui.ColorError, "❌ %s; %s [%s]\n", d.Summary, d.Detail, d.Subject.String())
 		}
 		return nil, false
 	}
