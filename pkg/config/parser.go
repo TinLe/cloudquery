@@ -1,10 +1,12 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
 	"strings"
 
+	"github.com/cloudquery/cloudquery/pkg/config/convert"
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclparse"
 	"github.com/spf13/afero"
@@ -49,6 +51,13 @@ func WithEnvironmentVariables(prefix string, vars []string) Option {
 	}
 }
 
+// WithFileFunc adds the file() function to the parser.
+func WithFileFunc(basePath string) Option {
+	return func(p *Parser) {
+		p.HCLContext.Functions["file"] = convert.MakeFileFunc(basePath)
+	}
+}
+
 // NewParser creates and returns a new Parser.
 func NewParser(options ...Option) *Parser {
 	p := Parser{
@@ -83,7 +92,11 @@ func (p *Parser) LoadHCLFile(path string) (hcl.Body, hcl.Diagnostics) {
 
 	if err != nil {
 		if e, ok := err.(*fs.PathError); ok {
-			err = fmt.Errorf(e.Err.Error())
+			if errors.Is(err, fs.ErrNotExist) {
+				err = fmt.Errorf("%s. Hint: Try `cloudquery init <provider>`.", e.Err.Error())
+			} else {
+				err = fmt.Errorf(e.Err.Error())
+			}
 		}
 		return nil, hcl.Diagnostics{
 			{

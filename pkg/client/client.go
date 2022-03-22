@@ -407,6 +407,10 @@ func (c *Client) Fetch(ctx context.Context, request FetchRequest) (res *FetchRes
 	}
 
 	for _, providerConfig := range request.Providers {
+		if len(providerConfig.Resources) == 0 {
+			c.Logger.Warn("skipping provider which configured with 0 resources to fetch", "provider", providerConfig.Name, "alias", providerConfig.Alias)
+			continue
+		}
 		providerConfig := providerConfig
 		createdAt := time.Now().UTC()
 		fetchSummary := FetchSummary{
@@ -433,9 +437,18 @@ func (c *Client) Fetch(ctx context.Context, request FetchRequest) (res *FetchRes
 			defer saveFetchSummary()
 			pLog := c.Logger.With("provider", providerConfig.Name, "alias", providerConfig.Alias, "version", providerPlugin.Version())
 			pLog.Info("requesting provider to configure")
+
+			metadata := map[string]interface{}{
+				"cq_fetch_id": fetchId.String(),
+			}
+
 			if c.HistoryCfg != nil {
 				fd := c.HistoryCfg.FetchDate()
 				pLog.Info("history enabled adding fetch date", "fetch_date", fd.Format(time.RFC3339))
+				metadata["cq_fetch_date"] = fd
+
+				// TODO Remove(Compatibility): Code below is for providers using the old SDK version, where metadata isn't available in FetchRequest
+				// Removing this without updating provider will set cq_fetch_date to the time of execution start, which HistoryCfg.TimeTruncation doesn't apply
 				if request.ExtraFields == nil {
 					request.ExtraFields = make(map[string]interface{})
 				}
@@ -464,6 +477,8 @@ func (c *Client) Fetch(ctx context.Context, request FetchRequest) (res *FetchRes
 					PartialFetchingEnabled: true,
 					ParallelFetchingLimit:  providerConfig.MaxParallelResourceFetchLimit,
 					MaxGoroutines:          providerConfig.MaxGoroutines,
+					Timeout:                time.Duration(providerConfig.ResourceTimeout) * time.Second,
+					Metadata:               metadata,
 				})
 			if err != nil {
 				return err
@@ -735,9 +750,10 @@ func (c *Client) UpgradeProvider(ctx context.Context, providerName string) (retE
 	return m.UpgradeProvider(cfg.Version)
 }
 
-func (c *Client) DowngradeProvider(ctx context.Context, providerName string) (retErr error) {
+func (c *Client) DowngradeProvider(ctx context.Context, providerName, version string) (retErr error) {
 	ctx, spanEnder := telemetry.StartSpanFromContext(ctx, "DowngradeProvider", trace.WithAttributes(
 		attribute.String("provider", providerName),
+		attribute.String("provider_version", version),
 	))
 	defer spanEnder(retErr)
 
@@ -748,6 +764,7 @@ func (c *Client) DowngradeProvider(ctx context.Context, providerName string) (re
 	if s.Migrations == nil {
 		return fmt.Errorf("provider doesn't support migrations")
 	}
+
 	m, cfg, err := c.buildProviderMigrator(ctx, s.Migrations, providerName)
 	if err != nil {
 		return err
@@ -757,8 +774,8 @@ func (c *Client) DowngradeProvider(ctx context.Context, providerName string) (re
 			c.Logger.Error("failed to close migrator connection", "error", err)
 		}
 	}()
-	c.Logger.Info("downgrading provider version", "version", cfg.Version, "provider", cfg.Name)
-	return m.DowngradeProvider(cfg.Version)
+	c.Logger.Info("downgrading provider version", "current_version", cfg.Version, "version", version, "provider", cfg.Name)
+	return m.DowngradeProvider(version)
 }
 
 func (c *Client) DropProvider(ctx context.Context, providerName string) (retErr error) {
@@ -963,7 +980,7 @@ func (c *Client) buildProviderMigrator(ctx context.Context, migrations map[strin
 		return nil, nil, fmt.Errorf("dialectExecutor.Setup: %w", err)
 	}
 
-	m, err := migrator.New(c.Logger, c.db.DialectType(), migrations, dsn, fmt.Sprintf("%s_%s", org, name), c.dialectExecutor.Finalize)
+	m, err := migrator.New(c.Logger, c.db.DialectType(), migrations, dsn, fmt.Sprintf("%s_%s", org, name), migrator.WithPreHook(c.dialectExecutor.Prepare), migrator.WithPostHook(c.dialectExecutor.Finalize))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -989,7 +1006,7 @@ func (c *Client) MigrateCore(ctx context.Context, de database.DialectExecutor) e
 	if err != nil {
 		return err
 	}
-	m, err := migrator.New(c.Logger, schema.Postgres, migrations, newDSN, "cloudquery_core", nil)
+	m, err := migrator.New(c.Logger, schema.Postgres, migrations, newDSN, "cloudquery_core")
 	if err != nil {
 		return err
 	}
@@ -1101,6 +1118,10 @@ func reportFetchSummaryErrors(span trace.Span, fetchSummaries map[string]Provide
 		}
 
 		for _, e := range ps.Diagnostics().Squash() {
+			if telemetry.ShouldIgnoreDiag(e) {
+				continue
+			}
+
 			if rd, ok := e.(diag.Redactable); ok {
 				if r := rd.Redacted(); r != nil {
 					e = r

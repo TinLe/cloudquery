@@ -20,6 +20,7 @@ func (p *Policy) Test(ctx context.Context, e *Executor, source, snapshotDirector
 	if err != nil {
 		return err
 	}
+	e.log.Debug("Found tests", "tests", tests)
 	for _, test := range tests {
 
 		selector := strings.TrimPrefix(test, snapshotDirectory+"/")
@@ -102,6 +103,9 @@ func OpenAndParse(filePath string) ([][]string, error) {
 }
 
 func FindAllTestCases(root string) ([]string, error) {
+	if _, err := os.Stat(root); os.IsNotExist(err) {
+		return []string{}, err
+	}
 	var files []string
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if !info.IsDir() && info.Name() == "snapshot_data.csv" {

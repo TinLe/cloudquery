@@ -429,7 +429,7 @@ func TestClient_ProviderMigrations(t *testing.T) {
 	assert.NoError(t, err)
 
 	c.Providers[0].Version = "v0.0.1"
-	err = c.DowngradeProvider(ctx, "test")
+	err = c.DowngradeProvider(ctx, "test", "v0.0.1")
 	assert.NoError(t, err)
 	_, err = conn.Exec(ctx, "select some_bool from slow_resource")
 	assert.NoError(t, err)
@@ -476,7 +476,7 @@ func TestClient_ProviderSkipVersionMigrations(t *testing.T) {
 	assert.Nil(t, err)
 
 	c.Providers[0].Version = "v0.0.1"
-	err = c.DowngradeProvider(ctx, "test")
+	err = c.DowngradeProvider(ctx, "test", "v0.0.1")
 	assert.Nil(t, err)
 	_, err = conn.Exec(ctx, "select some_bool from slow_resource")
 	assert.Nil(t, err)
@@ -547,8 +547,6 @@ provider "test" {
     "slow_resource",
     "very_slow_resource"
   ]
-  // enables partial fetching, allowing for any failures to not stop full resource pull
-  enable_partial_fetch = true
 }`
 
 func setupTestPlugin(t *testing.T) context.CancelFunc {
