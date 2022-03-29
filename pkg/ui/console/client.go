@@ -16,6 +16,7 @@ import (
 	"github.com/cloudquery/cloudquery/internal/telemetry"
 	sdkdb "github.com/cloudquery/cq-provider-sdk/database"
 	"github.com/cloudquery/cq-provider-sdk/migration/migrator"
+	"github.com/cloudquery/cq-provider-sdk/provider/diag"
 	"github.com/fatih/color"
 	"github.com/getsentry/sentry-go"
 	"github.com/golang-migrate/migrate/v4"
@@ -85,6 +86,36 @@ func CreateClientFromConfig(ctx context.Context, cfg *config.Config, opts ...cli
 	cClient.setTelemetryAttributes(trace.SpanFromContext(ctx))
 	cClient.checkForUpdate(ctx)
 	return cClient, err
+}
+
+func CreateNullClient(ctx context.Context, opts ...client.Option) (*Client, error) {
+	progressUpdater := NewProgress(ctx, func(o *ProgressOptions) {
+		o.AppendDecorators = []decor.Decorator{decor.Percentage()}
+	})
+	opts = append(opts, func(c *client.Client) {
+		if ui.IsTerminal() {
+			c.HubProgressUpdater = progressUpdater
+			c.PluginDirectory = "./.cq/providers"
+			c.PolicyDirectory = "./.cq/policies"
+		}
+	})
+	c, err := client.New(ctx, opts...)
+	if err != nil {
+		ui.ColorizedOutput(ui.ColorError, "❌ Failed to initialize client. Error: %s\n\n", err)
+		return nil, err
+	}
+	cClient := &Client{c, nil, progressUpdater}
+	return cClient, err
+}
+
+func ClientFactory(ctx context.Context, configPath *string, configMutator func(*config.Config) error, opts ...client.Option) (*Client, error) {
+	if configPath == nil {
+		return CreateNullClient(ctx)
+	}
+	if _, err := os.Stat(*configPath); errors.Is(err, os.ErrNotExist) {
+		return CreateNullClient(ctx)
+	}
+	return CreateClient(ctx, *configPath, configMutator, opts...)
 }
 
 func (c Client) DownloadProviders(ctx context.Context) error {
@@ -162,9 +193,14 @@ func (c Client) Fetch(ctx context.Context, failOnError bool) error {
 		if summary.ProviderName != summary.ProviderAlias {
 			key = fmt.Sprintf("%s(%s)", summary.ProviderName, summary.ProviderAlias)
 		}
-		ui.ColorizedOutput(ui.ColorHeader, "Provider %s fetch summary: %s Total Resources fetched: %d\t ⚠️ Warnings: %d\t ❌ Errors: %d\n",
-			key, status, summary.TotalResourcesFetched,
-			summary.Diagnostics().Warnings(), summary.Diagnostics().Errors())
+		diags := summary.Diagnostics().Squash()
+		ui.ColorizedOutput(ui.ColorHeader, "Provider %s fetch summary: %s Total Resources fetched: %d\t ⚠️ Warnings: %s\t ❌ Errors: %s\n",
+			key,
+			status,
+			summary.TotalResourcesFetched,
+			countSeverity(diags, diag.WARNING),
+			countSeverity(diags, diag.ERROR),
+		)
 		if failOnError && summary.HasErrors() {
 			err = fmt.Errorf("provider fetch has one or more errors")
 		}
@@ -286,7 +322,7 @@ func (c Client) SnapshotPolicy(ctx context.Context, policySource, snapshotDestin
 }
 
 func (c Client) DescribePolicies(ctx context.Context, policySource string) error {
-	policiesToDescribe, err := FilterPolicies(policySource, c.cfg.Policies)
+	policiesToDescribe, err := FilterPolicies(policySource, []*policy.Policy{})
 	if err != nil {
 		ui.ColorizedOutput(ui.ColorError, err.Error())
 		return err
@@ -782,4 +818,19 @@ func loadConfig(file string) (*config.Config, bool) {
 		return nil, false
 	}
 	return cfg, true
+}
+
+func countSeverity(d diag.Diagnostics, sev diag.Severity) string {
+	basicCount := d.CountBySeverity(sev, false)
+
+	if !viper.GetBool("verbose") {
+		return fmt.Sprintf("%d", basicCount)
+	}
+
+	deepCount := d.CountBySeverity(sev, true)
+	if basicCount == deepCount {
+		return fmt.Sprintf("%d", basicCount)
+	}
+
+	return fmt.Sprintf("%d(%d)", basicCount, deepCount)
 }

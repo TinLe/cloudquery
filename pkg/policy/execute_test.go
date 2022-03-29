@@ -2,10 +2,17 @@ package policy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
+	"time"
 
+	"github.com/cloudquery/cloudquery/pkg/client/database"
+	"github.com/cloudquery/cloudquery/pkg/client/history"
+	"github.com/cloudquery/cloudquery/pkg/client/meta_storage"
 	sdkdb "github.com/cloudquery/cq-provider-sdk/database"
+	"github.com/cloudquery/cq-provider-sdk/provider/execution"
+	"github.com/google/uuid"
 	"github.com/hashicorp/go-hclog"
 	"github.com/stretchr/testify/assert"
 )
@@ -242,6 +249,28 @@ var (
 			ExpectOutput: true,
 		}},
 	}
+	// views cannot be inherited from parent policies.
+	multiLayerWithInheritedView = &Policy{
+		Name: "test",
+		Views: []*View{
+			{
+				Name:  "testview",
+				Query: "SELECT 'something'",
+			},
+		},
+		Policies: Policies{
+			{
+				Name: "subpolicy",
+				Checks: []*Check{
+					{
+						Name:         "query-with-view",
+						ExpectOutput: true,
+						Query:        "SELECT * from testview",
+					},
+				},
+			},
+		},
+	}
 )
 
 func TestExecutor_Execute(t *testing.T) {
@@ -315,6 +344,11 @@ func TestExecutor_Execute(t *testing.T) {
 			Pass:                 true,
 			TotalExpectedResults: 1,
 		},
+		{
+			Name:        "multilayer policy w/ using view inherited from parent",
+			Policy:      multiLayerWithInheritedView,
+			ErrorOutput: "relation \"testview\" does not exist",
+		},
 	}
 
 	conn, tearDownFunc := setupPolicyDatabase(t, t.Name())
@@ -331,7 +365,10 @@ func TestExecutor_Execute(t *testing.T) {
 			filtered := tc.Policy.Filter(tc.Selector)
 			res, err := executor.Execute(context.Background(), execReq, &filtered)
 			if tc.ErrorOutput != "" {
-				assert.EqualError(t, err, tc.ErrorOutput)
+				if assert.Error(t, err) {
+					assert.Contains(t, err.Error(), tc.ErrorOutput)
+				}
+				return
 			} else {
 				assert.NoError(t, err)
 			}
@@ -345,5 +382,127 @@ func TestExecutor_Execute(t *testing.T) {
 				assert.Len(t, res.Results, tc.TotalExpectedResults)
 			}
 		})
+	}
+}
+
+func setupCheckFetchDatabase(db execution.QueryExecer, summary *meta_storage.FetchSummary, c *meta_storage.Client) (error, func(t *testing.T)) {
+	if summary == nil {
+		return nil, func(t *testing.T) {}
+	}
+	summary.CqId = uuid.New()
+	summary.FetchId = uuid.New()
+	finish := time.Now().UTC()
+	summary.Finish = &finish
+	err := c.SaveFetchSummary(context.Background(), summary)
+	if err != nil {
+		return err, nil
+	}
+
+	// Return conn and tear down func
+	return nil, func(t *testing.T) {
+		err = db.Exec(context.Background(), fmt.Sprintf(`DELETE FROM "cloudquery"."fetches" WHERE "id" = '%s';`, summary.FetchId.String()))
+		assert.NoError(t, err)
+	}
+}
+
+func TestExecutor_CheckFetches(t *testing.T) {
+	// create database connection
+	db, err := sdkdb.New(context.Background(), hclog.NewNullLogger(), testDBConnection)
+	assert.NoError(t, err)
+
+	metaStorage := meta_storage.NewClient(db, hclog.NewNullLogger())
+
+	_, de, err := database.GetExecutor(hclog.NewNullLogger(), testDBConnection, &history.Config{})
+	if err != nil {
+		t.Fatal(fmt.Errorf("getExecutor: %w", err))
+	}
+
+	err = metaStorage.MigrateCore(context.Background(), de)
+	assert.NoError(t, err)
+
+	executor := NewExecutor(db, hclog.Default(), nil)
+
+	finish := time.Now().UTC()
+	assert.NoError(t, err)
+	cases := []struct {
+		Name   string
+		Config Configuration
+		f      *meta_storage.FetchSummary
+		err    error
+	}{
+		{
+			Name: "correct version",
+			Config: Configuration{
+				Providers: []*Provider{
+					{Type: "test1", Version: "~> v0.2.0"},
+				},
+			},
+			f:   &meta_storage.FetchSummary{ProviderName: "test1", ProviderVersion: "v0.2.3", Finish: &finish, IsSuccess: true},
+			err: nil,
+		},
+		{
+			Name: "no fetches",
+			Config: Configuration{
+				Providers: []*Provider{
+					{Type: "test2", Version: "~> v0.2.0"},
+				},
+			},
+			err: errors.New("failed to get fetch summary for provider test2: could not find a completed fetch for requested provider"),
+		}, {
+			Name: "no finished fetches",
+			Config: Configuration{
+				Providers: []*Provider{
+					{Type: "no_finish", Version: "~> v0.2.0"},
+				},
+			},
+			f:   &meta_storage.FetchSummary{ProviderName: "test3", ProviderVersion: "v0.2.3", IsSuccess: false},
+			err: errors.New("failed to get fetch summary for provider no_finish: could not find a completed fetch for requested provider"),
+		},
+		{
+			Name: "no fetches",
+			Config: Configuration{
+				Providers: []*Provider{
+					{Type: "test3", Version: "~> v0.2.0"},
+				},
+			},
+			f:   &meta_storage.FetchSummary{ProviderName: "test3", ProviderVersion: "v0.2.3", Finish: &finish, IsSuccess: false},
+			err: errors.New("last fetch for provider test3 wasn't successful"),
+		},
+		{
+			Name: "no fetches",
+			Config: Configuration{
+				Providers: []*Provider{
+					{Type: "test4", Version: "~> v0.3.0"},
+				},
+			},
+			f:   &meta_storage.FetchSummary{ProviderName: "test4", ProviderVersion: "v0.2.3", Finish: &finish, IsSuccess: true},
+			err: errors.New("the latest fetch for provider test4 does not satisfy version requirement ~> v0.3.0"),
+		},
+		{
+			Name: "no fetches",
+			Config: Configuration{
+				Providers: []*Provider{
+					{Type: "test4", Version: ""},
+				},
+			},
+			f:   &meta_storage.FetchSummary{ProviderName: "test4", ProviderVersion: "v0.2.3", Finish: &finish, IsSuccess: true},
+			err: errors.New("failed to parse version constraint for provider test4: Malformed constraint: "),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			err, clear := setupCheckFetchDatabase(db, tc.f, metaStorage)
+			assert.NoError(t, err)
+
+			err = executor.checkFetches(context.Background(), &tc.Config)
+			if tc.err != nil {
+				assert.Equal(t, tc.err.Error(), err.Error())
+			} else {
+				assert.NoError(t, err)
+			}
+			clear(t)
+		})
+
 	}
 }
