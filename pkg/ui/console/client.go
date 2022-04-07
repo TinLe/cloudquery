@@ -65,6 +65,9 @@ func CreateClientFromConfig(ctx context.Context, cfg *config.Config, opts ...cli
 	progressUpdater := NewProgress(ctx, func(o *ProgressOptions) {
 		o.AppendDecorators = []decor.Decorator{decor.Percentage()}
 	})
+	if cfg.CloudQuery.Connection == nil {
+		return nil, errors.New("connection configuration is not set")
+	}
 	opts = append(opts, func(c *client.Client) {
 		if ui.IsTerminal() {
 			c.HubProgressUpdater = progressUpdater
@@ -536,6 +539,33 @@ func (c Client) BuildAllProviderTables(ctx context.Context) error {
 	return nil
 }
 
+func (c Client) RemoveStaleData(ctx context.Context, lastUpdate time.Duration, dryRun bool, providers []string) error {
+	if err := c.DownloadProviders(ctx); err != nil {
+		return err
+	}
+	ui.ColorizedOutput(ui.ColorHeader, "Purging providers %s resources..\n\n", providers)
+	result, diags := client.PurgeProviderData(ctx, client.NewStorage(c.c.DSN), c.c.Manager, &client.PurgeProviderDataOptions{
+		Providers:  providers,
+		LastUpdate: lastUpdate,
+		DryRun:     dryRun,
+	})
+
+	if dryRun && !diags.HasErrors() {
+		ui.ColorizedOutput(ui.ColorWarning, "Expected resources to be purged: %d. Use --dry-run=false to purge these resources.\n", result.TotalAffected)
+		for _, r := range result.Resources() {
+			ui.ColorizedOutput(ui.ColorWarning, "\t%s: %d resources\n\n", r, result.AffectedResources[r])
+		}
+	}
+
+	if len(diags) > 0 {
+		printDiagnostics("Purge", "", diags, viper.GetBool("redact-diags"), viper.GetBool("verbose"))
+		return diags
+	} else {
+		ui.ColorizedOutput(ui.ColorProgress, "Purge for providers %s was successful\n\n", providers)
+	}
+	return nil
+}
+
 func (c Client) buildProviderTables(ctx context.Context, providerName string) error {
 	ui.ColorizedOutput(ui.ColorProgress, "Building CloudQuery provider %s schema...\n\n", providerName)
 	if err := c.c.BuildProviderTables(ctx, providerName); err != nil {
@@ -808,14 +838,22 @@ func loadConfig(file string) (*config.Config, bool) {
 	if diags != nil {
 		ui.ColorizedOutput(ui.ColorHeader, "Configuration Error Diagnostics:\n")
 		for _, d := range diags {
+			c := ui.ColorInfo
+			switch d.Severity {
+			case hcl.DiagError:
+				c = ui.ColorError
+			case hcl.DiagWarning:
+				c = ui.ColorWarning
+			}
 			if d.Subject == nil {
-				ui.ColorizedOutput(ui.ColorError, "❌ %s; %s\n", d.Summary, d.Detail)
+				ui.ColorizedOutput(c, "❌ %s; %s\n", d.Summary, d.Detail)
 				continue
 			}
-
-			ui.ColorizedOutput(ui.ColorError, "❌ %s; %s [%s]\n", d.Summary, d.Detail, d.Subject.String())
+			ui.ColorizedOutput(c, "❌ %s; %s [%s]\n", d.Summary, d.Detail, d.Subject.String())
 		}
-		return nil, false
+		if diags.HasErrors() {
+			return nil, false
+		}
 	}
 	return cfg, true
 }
